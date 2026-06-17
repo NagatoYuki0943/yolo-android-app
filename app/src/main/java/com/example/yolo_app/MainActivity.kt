@@ -75,6 +75,10 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.max
+import kotlin.math.roundToInt
+
+private const val DefaultColorClassCount = 80
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -769,6 +773,10 @@ private fun DetectionOverlay(
     Canvas(modifier = modifier) {
         val imageRatio = bitmap.width.toFloat() / bitmap.height.toFloat()
         val canvasRatio = size.width / size.height
+        val colorClassCount = max(
+            DefaultColorClassCount,
+            detections.maxOfOrNull { it.classId + 1 } ?: DefaultColorClassCount,
+        )
         val drawWidth: Float
         val drawHeight: Float
         if (canvasRatio > imageRatio) {
@@ -789,8 +797,9 @@ private fun DetectionOverlay(
             val top = offsetY + detection.top * scaleY
             val right = offsetX + detection.right * scaleX
             val bottom = offsetY + detection.bottom * scaleY
+            val detectionColor = colorForClass(detection.classId, colorClassCount)
             drawRect(
-                color = Color(0xFFFFD54F),
+                color = detectionColor,
                 topLeft = Offset(left, top),
                 size = Size(width = right - left, height = bottom - top),
                 style = Stroke(width = strokeWidth),
@@ -799,15 +808,23 @@ private fun DetectionOverlay(
                 text = "${detection.label} ${"%.1f".format(detection.score * 100)}%",
                 left = left,
                 top = top,
+                backgroundColor = detectionColor,
             )
         }
     }
+}
+
+private fun colorForClass(classId: Int, classCount: Int): Color {
+    val safeClassCount = max(1, classCount)
+    val hue = (classId.coerceAtLeast(0) % safeClassCount) * 360.0f / safeClassCount
+    return Color.hsv(hue, 0.7f, 1.0f)
 }
 
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawLabel(
     text: String,
     left: Float,
     top: Float,
+    backgroundColor: Color,
 ) {
     val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = android.graphics.Color.BLACK
@@ -815,7 +832,7 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawLabel(
         style = Paint.Style.FILL
     }
     val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = android.graphics.Color.argb(220, 255, 213, 79)
+        color = backgroundColor.toAndroidColor(alpha = 220)
         style = Paint.Style.FILL
     }
     val padding = 4.dp.toPx()
@@ -831,6 +848,15 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawLabel(
         )
         canvas.nativeCanvas.drawText(text, left + padding, baseline, textPaint)
     }
+}
+
+private fun Color.toAndroidColor(alpha: Int = 255): Int {
+    return android.graphics.Color.argb(
+        alpha,
+        (red * 255).roundToInt().coerceIn(0, 255),
+        (green * 255).roundToInt().coerceIn(0, 255),
+        (blue * 255).roundToInt().coerceIn(0, 255),
+    )
 }
 
 private fun ImageProxy.toBitmapArgb8888(): Bitmap {
