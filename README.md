@@ -1,20 +1,26 @@
-# YOLO Android ncnn Demo
+# YOLO Android Demo
 
-这个项目是一个使用 Kotlin + Jetpack Compose 编写的 Android YOLO 推理 demo。当前已经接入 ncnn，可以在 Android 设备上用 CPU 或 Vulkan GPU 运行 YOLO 检测模型，并支持图片推理和摄像头实时推理。
+这个项目是一个使用 Kotlin + Jetpack Compose 编写的 Android YOLO 推理 demo。当前已经接入两种推理后端：
 
-> 说明：项目目标中提到的 ONNX Runtime 还没有接入；当前可用的推理后端是 ncnn。
+- ncnn：通过 C++ JNI 调用，支持 CPU 和 Vulkan GPU。
+- ONNX Runtime Android：通过 Kotlin 直接调用，支持 CPU 和 Android NNAPI 加速尝试。
+
+应用支持图片推理和摄像头实时推理，可以在界面上切换推理后端、CPU/GPU 或 NNAPI、置信度阈值和 IoU 阈值。
+
+<img src="images/demo.png" height=600>
 
 ## 功能
 
 - 图片推理：从系统相册选择图片，运行 YOLO 检测并显示结果图。
 - 摄像头实时推理：使用 CameraX 获取后置摄像头画面，实时检测并绘制检测框。
-- CPU / GPU 切换：默认使用 GPU，界面上可以手动切换 CPU 或 GPU。
-- GPU 失败回退：如果 GPU 初始化或推理失败，会提示错误并自动切换到 CPU。
-- 开始 / 暂停摄像头推理：摄像头模式下可以暂停或恢复分析帧。
+- 推理后端切换：支持 `ncnn` 和 `ONNX Runtime`。
+- ncnn CPU / GPU：默认使用 GPU，GPU 失败时提示并自动切换到 CPU。
+- ONNX Runtime CPU / NNAPI：ONNX Runtime 的加速按钮显示为 `NNAPI`。如果当前模型或设备不支持 NNAPI，会提示并自动切换到 CPU。
+- 开始 / 暂停摄像头推理：摄像头模式下需要手动开始，可以暂停或恢复分析帧。
 - 置信度和 IoU 阈值设置：界面提供可折叠的阈值设置区域。
 - 结果可视化：检测框左上角显示类别名和置信度。
-- 性能显示：摄像头实时推理时显示单帧推理耗时和 FPS。
-- 模型配置读取：输入尺寸、类别数量和类别名称从 `metadata.yaml` 读取，不再写死在 C++ 中。
+- 性能显示：在图片或视频上方显示单帧推理耗时，摄像头模式额外显示 FPS。
+- 模型配置读取：ncnn 从 `metadata.yaml` 读取输入尺寸和类别名称；ONNX Runtime 从 ONNX metadata 读取 `imgsz` 和 `names`。
 - App 图标：使用根目录 `logo.png` 生成的 adaptive launcher icon。
 
 ## 编程环境
@@ -45,6 +51,7 @@
   - `camera-core`
   - `camera-camera2`
   - `camera-lifecycle`
+- ONNX Runtime Android `1.26.0`
 - JUnit / AndroidX Test / Espresso
 
 Native 侧依赖：
@@ -84,7 +91,9 @@ app/src/main/cpp/ncnn-android-vulkan/
 
 ## 模型文件
 
-当前模型资产目录：
+### ncnn 模型
+
+当前 ncnn 模型资产目录：
 
 ```text
 app/src/main/assets/yolo26n_ncnn_model/
@@ -98,31 +107,75 @@ app/src/main/assets/yolo26n_ncnn_model/
 - `imgsz`：模型输入尺寸，例如 `[640, 640]`
 - `names`：类别 id 到类别名的映射
 
-Kotlin JNI 包装类会把这些资产路径传给 C++：
+ncnn JNI 包装类：
 
 ```text
 app/src/main/java/com/example/yolo_app/detector/NcnnYoloDetector.kt
 ```
 
-C++ ncnn 实现位于：
+C++ ncnn 实现：
 
 ```text
 app/src/main/cpp/ncnn_yolo_jni.cpp
 ```
 
+### ONNX Runtime 模型
+
+当前 ONNX 模型资产目录：
+
+```text
+app/src/main/assets/yolo26n_onnx_model/
+  model.onnx
+```
+
+ONNX Runtime 封装类：
+
+```text
+app/src/main/java/com/example/yolo_app/detector/OnnxYoloDetector.kt
+```
+
+ONNX 模型要求：
+
+- 输入默认按 `FLOAT [1, 3, H, W]` 处理，图像预处理为 RGB、letterbox、归一化到 `0..1`。
+- 从 ONNX metadata 读取 `imgsz` 和 `names`。
+- 支持两类输出：
+  - `[1, 300, 6]`：end-to-end 输出，格式按 `[x1, y1, x2, y2, score, classId]` 解析。
+  - `[1, 84, 8400]` 或 `[1, 8400, 84]`：YOLO raw head 输出，格式按 `[cx, cy, w, h, class_scores...]` 解析，并在 Kotlin 侧执行 NMS。
+
+当前 int8 量化 ONNX 模型会输出 raw head `[1, 84, 8400]`。原因是量化后的 end-to-end 后处理会把类别分数分支压成 0，导致 `[1, 300, 6]` 的 score 全部为 0；因此项目将该模型的输出改到后处理前，并在 App 侧解析和 NMS。
+
+## ONNX Runtime 使用说明
+
+ONNX Runtime Android 通过 Maven 依赖引入：
+
+```kotlin
+implementation(libs.onnxruntime.android)
+```
+
+界面中的 ONNX Runtime 设备选项：
+
+- `CPU`：使用 ONNX Runtime CPUExecutionProvider。
+- `NNAPI`：调用 ONNX Runtime Android 的 NNAPI Execution Provider。NNAPI 是否真正使用 GPU/NPU/CPU 由手机系统、芯片驱动和模型算子支持情况决定。
+
+已知情况：
+
+- 当前测试设备上，ONNX Runtime NNAPI 会因为模型中的部分节点不被支持而失败。
+- App 会捕获失败，显示短提示，并自动切换到 CPU。
+- ncnn 的 `GPU` 是 Vulkan 路径，和 ONNX Runtime 的 `NNAPI` 不是同一种加速方式。
+
 ## 推理流程
 
 1. Kotlin UI 获取图片或 CameraX 视频帧。
 2. 根据 EXIF 或 CameraX rotation 信息修正图像方向。
-3. 调用 `NcnnYoloDetector.detect(...)`。
-4. Native C++ 将 Android `Bitmap` 转为 ncnn 输入。
-5. 按 `metadata.yaml` 读取到的输入尺寸进行 letterbox 预处理。
-6. 调用 ncnn 网络推理。
-7. 解析 YOLO 输出，执行置信度过滤和 NMS。
-8. 返回 Kotlin `Detection` 列表。
-9. Compose Canvas 绘制检测框、类别、分数、耗时和 FPS。
+3. 根据界面选择调用 `NcnnYoloDetector.detect(...)` 或 `OnnxYoloDetector.detect(...)`。
+4. 按模型输入尺寸进行 letterbox 预处理。
+5. 调用对应后端执行推理。
+6. 解析 YOLO 输出，执行置信度过滤和 NMS。
+7. 返回 Kotlin `Detection` 列表。
+8. Compose Canvas 绘制检测框、类别和分数。
+9. 在预览上方显示耗时和 FPS。
 
-模型不是每次检测都重新载入。App 会按当前设备类型维护 detector 实例，第一次推理时创建并加载模型，之后复用；切换 CPU/GPU 或释放资源时才会销毁并重建。
+模型不是每次检测都重新载入。App 会按当前后端和设备类型维护 detector 实例，第一次推理时创建并加载模型，之后复用；切换后端、切换 CPU/GPU/NNAPI 或释放资源时才会销毁并重建。
 
 ## 构建
 
@@ -172,17 +225,20 @@ adb shell pm grant com.example.yolo_app android.permission.CAMERA
 
 ```text
 app/src/main/java/com/example/yolo_app/MainActivity.kt
-app/src/main/java/com/example/yolo_app/detector/NcnnYoloDetector.kt
 app/src/main/java/com/example/yolo_app/detector/Detection.kt
+app/src/main/java/com/example/yolo_app/detector/NcnnYoloDetector.kt
+app/src/main/java/com/example/yolo_app/detector/OnnxYoloDetector.kt
 app/src/main/cpp/ncnn_yolo_jni.cpp
 app/src/main/cpp/ncnn_yolo_stub_jni.cpp
 app/src/main/cpp/CMakeLists.txt
 app/src/main/assets/yolo26n_ncnn_model/
+app/src/main/assets/yolo26n_onnx_model/
+images/demo.png
 ```
 
 ## 当前限制
 
-- 当前只实现 ncnn 后端，ONNX Runtime 还没有集成。
-- Native 解析逻辑按当前 YOLO ncnn 输出格式实现，替换不同模型时需要确认输出张量布局是否一致。
-- `metadata.yaml` 解析是轻量实现，适合当前 Ultralytics 导出的 metadata 格式。
 - 摄像头实时推理当前使用后置摄像头。
+- ONNX Runtime 的 `NNAPI` 并不等价于 Vulkan GPU，是否可用取决于设备和模型算子支持。
+- 当前 ONNX int8 模型使用 raw head 输出并在 Kotlin 侧做 NMS。如果替换模型，请确认输出 shape 是 `[1,300,6]`、`[1,84,8400]` 或 `[1,8400,84]`。
+- ncnn 和 ONNX Runtime 使用各自的模型文件，替换模型时需要分别更新对应 assets 目录。

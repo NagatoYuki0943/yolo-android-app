@@ -68,6 +68,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.example.yolo_app.detector.Detection
 import com.example.yolo_app.detector.NcnnYoloDetector
+import com.example.yolo_app.detector.OnnxYoloDetector
 import com.example.yolo_app.ui.theme.YoloappTheme
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
@@ -102,14 +103,31 @@ private enum class InferenceDevice(
     Cpu("CPU", false),
 }
 
+private fun InferenceDevice.displayNameFor(engine: InferenceEngine): String {
+    return if (engine == InferenceEngine.Onnx && this == InferenceDevice.Gpu) {
+        "NNAPI"
+    } else {
+        displayName
+    }
+}
+
+private enum class InferenceEngine(
+    val displayName: String,
+) {
+    Ncnn("ncnn"),
+    Onnx("ONNX Runtime"),
+}
+
 private data class TimedDetectionResult(
     val detections: List<Detection>,
     val elapsedMs: Float,
+    val engine: InferenceEngine,
     val device: InferenceDevice,
     val fallbackMessage: String? = null,
 )
 
 private data class InferenceOptions(
+    val engine: InferenceEngine,
     val device: InferenceDevice,
     val scoreThreshold: Float,
     val iouThreshold: Float,
@@ -118,25 +136,30 @@ private data class InferenceOptions(
 private class DetectorHolder(
     private val context: Context,
 ) : AutoCloseable {
-    private var detector: NcnnYoloDetector? = null
+    private var detector: ActiveDetector? = null
+    private var engine: InferenceEngine? = null
     private var device: InferenceDevice? = null
+    private val unavailableGpuMessages = mutableMapOf<InferenceEngine, String>()
 
     @Synchronized
     fun closeCurrent() {
         detector?.close()
         detector = null
+        engine = null
         device = null
     }
 
     @Synchronized
     fun detect(
         bitmap: Bitmap,
+        requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
         scoreThreshold: Float,
         iouThreshold: Float,
     ): TimedDetectionResult {
         return tryDetect(
             bitmap = bitmap,
+            requestedEngine = requestedEngine,
             requestedDevice = requestedDevice,
             scoreThreshold = scoreThreshold,
             iouThreshold = iouThreshold,
@@ -151,13 +174,28 @@ private class DetectorHolder(
 
     private fun tryDetect(
         bitmap: Bitmap,
+        requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
         scoreThreshold: Float,
         iouThreshold: Float,
         fallbackMessage: String?,
     ): TimedDetectionResult {
+        if (requestedDevice == InferenceDevice.Gpu) {
+            val unavailableMessage = unavailableGpuMessages[requestedEngine]
+            if (unavailableMessage != null) {
+                return tryDetect(
+                    bitmap = bitmap,
+                    requestedEngine = requestedEngine,
+                    requestedDevice = InferenceDevice.Cpu,
+                    scoreThreshold = scoreThreshold,
+                    iouThreshold = iouThreshold,
+                    fallbackMessage = unavailableMessage,
+                )
+            }
+        }
+
         return try {
-            val activeDetector = ensureDetector(requestedDevice)
+            val activeDetector = ensureDetector(requestedEngine, requestedDevice)
             val startNs = SystemClock.elapsedRealtimeNanos()
             val detections = activeDetector.detect(
                 bitmap = bitmap,
@@ -168,18 +206,24 @@ private class DetectorHolder(
             TimedDetectionResult(
                 detections = detections,
                 elapsedMs = elapsedMs,
+                engine = requestedEngine,
                 device = requestedDevice,
                 fallbackMessage = fallbackMessage,
             )
         } catch (error: Throwable) {
             closeCurrent()
             if (requestedDevice == InferenceDevice.Gpu) {
+                val message = gpuFallbackMessage(requestedEngine, error)
+                if (requestedEngine == InferenceEngine.Onnx) {
+                    unavailableGpuMessages[requestedEngine] = message
+                }
                 tryDetect(
                     bitmap = bitmap,
+                    requestedEngine = requestedEngine,
                     requestedDevice = InferenceDevice.Cpu,
                     scoreThreshold = scoreThreshold,
                     iouThreshold = iouThreshold,
-                    fallbackMessage = "GPU 推理失败，已切换到 CPU：${error.message ?: error.javaClass.simpleName}",
+                    fallbackMessage = message,
                 )
             } else {
                 throw error
@@ -187,18 +231,62 @@ private class DetectorHolder(
         }
     }
 
-    private fun ensureDetector(requestedDevice: InferenceDevice): NcnnYoloDetector {
+    private fun ensureDetector(
+        requestedEngine: InferenceEngine,
+        requestedDevice: InferenceDevice,
+    ): ActiveDetector {
         val activeDetector = detector
-        if (activeDetector != null && device == requestedDevice) {
+        if (activeDetector != null && engine == requestedEngine && device == requestedDevice) {
             return activeDetector
         }
 
         closeCurrent()
-        return NcnnYoloDetector(context, useGpu = requestedDevice.useGpu).also {
+        val createdDetector = when (requestedEngine) {
+            InferenceEngine.Ncnn -> ActiveDetector.Ncnn(
+                NcnnYoloDetector(context, useGpu = requestedDevice.useGpu),
+            )
+            InferenceEngine.Onnx -> ActiveDetector.Onnx(
+                OnnxYoloDetector(context, useNnapi = requestedDevice.useGpu),
+            )
+        }
+        return createdDetector.also {
             detector = it
+            engine = requestedEngine
             device = requestedDevice
         }
     }
+
+    private sealed class ActiveDetector : AutoCloseable {
+        abstract fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection>
+
+        class Ncnn(private val detector: NcnnYoloDetector) : ActiveDetector() {
+            override fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection> {
+                return detector.detect(bitmap, scoreThreshold, nmsThreshold)
+            }
+
+            override fun close() = detector.close()
+        }
+
+        class Onnx(private val detector: OnnxYoloDetector) : ActiveDetector() {
+            override fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection> {
+                return detector.detect(bitmap, scoreThreshold, nmsThreshold)
+            }
+
+            override fun close() = detector.close()
+        }
+    }
+}
+
+private fun gpuFallbackMessage(engine: InferenceEngine, error: Throwable): String {
+    val detail = error.message ?: error.javaClass.simpleName
+    if (engine == InferenceEngine.Onnx) {
+        return if (detail.contains("AddNnapiSplit", ignoreCase = true)) {
+            "ONNX Runtime NNAPI 不支持当前模型中的 Split 节点，已切换到 CPU"
+        } else {
+            "ONNX Runtime NNAPI 加速不可用，已切换到 CPU：${detail.take(80)}"
+        }
+    }
+    return "${engine.displayName} GPU 推理失败，已切换到 CPU：${detail.take(80)}"
 }
 
 @Composable
@@ -212,6 +300,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
     var latencyMs by remember { mutableStateOf<Float?>(null) }
     var fps by remember { mutableStateOf<Float?>(null) }
     var cameraRunning by remember { mutableStateOf(false) }
+    var inferenceEngine by remember { mutableStateOf(InferenceEngine.Ncnn) }
     var inferenceDevice by remember { mutableStateOf(InferenceDevice.Gpu) }
     var scoreThreshold by remember { mutableStateOf(0.35f) }
     var iouThreshold by remember { mutableStateOf(0.45f) }
@@ -257,6 +346,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
             },
             enabled = cameraRunning,
             options = InferenceOptions(
+                engine = inferenceEngine,
                 device = inferenceDevice,
                 scoreThreshold = scoreThreshold,
                 iouThreshold = iouThreshold,
@@ -269,7 +359,8 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                 if (result.fallbackMessage != null && result.device != inferenceDevice) {
                     inferenceDevice = result.device
                 }
-                status = result.fallbackMessage ?: "实时推理中：${result.detections.size} 个目标，${inferenceDevice.displayName}"
+                status = result.fallbackMessage
+                    ?: "实时推理中：${result.detections.size} 个目标，${result.engine.displayName} ${result.device.displayNameFor(result.engine)}"
             },
             onError = { error ->
                 status = error.message ?: error.javaClass.simpleName
@@ -284,7 +375,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(text = "YOLO ncnn Demo", style = MaterialTheme.typography.headlineSmall)
+        Text(text = "YOLO Demo", style = MaterialTheme.typography.headlineSmall)
         Text(text = status, style = MaterialTheme.typography.bodyMedium)
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -321,29 +412,34 @@ fun YoloScreen(modifier: Modifier = Modifier) {
             )
         }
 
-        if (mode == InferenceMode.Camera) {
-            Button(
-                onClick = {
-                    if (!hasCameraPermission) {
-                        permissionLauncher.launch(Manifest.permission.CAMERA)
-                    } else {
-                        cameraRunning = !cameraRunning
-                        status = if (cameraRunning) {
-                            "正在启动摄像头"
-                        } else {
-                            "摄像头推理已暂停"
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            InferenceEngine.entries.forEach { engine ->
+                ModeButton(
+                    text = engine.displayName,
+                    selected = inferenceEngine == engine,
+                    onClick = {
+                        if (inferenceEngine != engine) {
+                            inferenceEngine = engine
+                            if (mode != InferenceMode.Camera) {
+                                detectorHolder.closeCurrent()
+                            }
+                            latencyMs = null
+                            fps = null
+                            status = if (mode == InferenceMode.Camera) {
+                                "将从下一帧切换到 ${engine.displayName}"
+                            } else {
+                                "已切换到 ${engine.displayName}"
+                            }
                         }
-                    }
-                },
-            ) {
-                Text(if (cameraRunning) "暂停摄像头推理" else "开始摄像头推理")
+                    },
+                )
             }
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             InferenceDevice.entries.forEach { device ->
                 ModeButton(
-                    text = device.displayName,
+                    text = device.displayNameFor(inferenceEngine),
                     selected = inferenceDevice == device,
                     onClick = {
                         if (inferenceDevice != device) {
@@ -354,9 +450,9 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                             latencyMs = null
                             fps = null
                             status = if (mode == InferenceMode.Camera) {
-                                "将从下一帧切换到 ${device.displayName} 推理"
+                                "将从下一帧切换到 ${device.displayNameFor(inferenceEngine)} 推理"
                             } else {
-                                "已切换到 ${device.displayName} 推理"
+                                "已切换到 ${device.displayNameFor(inferenceEngine)} 推理"
                             }
                         }
                     },
@@ -387,7 +483,24 @@ fun YoloScreen(modifier: Modifier = Modifier) {
             )
         }
 
-        if (mode == InferenceMode.Image) {
+        if (mode == InferenceMode.Camera) {
+            Button(
+                onClick = {
+                    if (!hasCameraPermission) {
+                        permissionLauncher.launch(Manifest.permission.CAMERA)
+                    } else {
+                        cameraRunning = !cameraRunning
+                        status = if (cameraRunning) {
+                            "正在启动摄像头"
+                        } else {
+                            "摄像头推理已暂停"
+                        }
+                    }
+                },
+            ) {
+                Text(if (cameraRunning) "暂停摄像头推理" else "开始摄像头推理")
+            }
+        } else {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = {
@@ -405,6 +518,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                             try {
                                 val result = detectorHolder.detect(
                                     bitmap = source,
+                                    requestedEngine = inferenceEngine,
                                     requestedDevice = inferenceDevice,
                                     scoreThreshold = scoreThreshold,
                                     iouThreshold = iouThreshold,
@@ -416,7 +530,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                                     inferenceDevice = result.device
                                 }
                                 status = result.fallbackMessage
-                                    ?: "图片检测完成：${result.detections.size} 个目标，${result.device.displayName}，${"%.1f".format(result.elapsedMs)} ms"
+                                    ?: "图片检测完成：${result.detections.size} 个目标，${result.engine.displayName} ${result.device.displayNameFor(result.engine)}，${"%.1f".format(result.elapsedMs)} ms"
                             } catch (error: Throwable) {
                                 status = error.message ?: error.javaClass.simpleName
                             }
@@ -552,6 +666,7 @@ private fun CameraInferenceEffect(
 
                             val result = detectorProvider().detect(
                                 bitmap = bitmap,
+                                requestedEngine = currentOptions.engine,
                                 requestedDevice = currentOptions.device,
                                 scoreThreshold = currentOptions.scoreThreshold,
                                 iouThreshold = currentOptions.iouThreshold,
