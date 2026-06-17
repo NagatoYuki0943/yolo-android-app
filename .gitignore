@@ -1,15 +1,46 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Gradle / Android build outputs
+.gradle/
+.kotlin/
+build/
+**/build/
+captures/
+gradle/gradle-daemon-jvm.properties
+
+# Android native build outputs
+.cxx/
+**/.cxx/
+.externalNativeBuild/
+**/.externalNativeBuild/
+
+# Local machine configuration
 local.properties
+*.local
+
+# Android Studio / IntelliJ IDEA
+*.iml
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and crash dumps
+*.log
+hs_err_pid*
+
+# APK / bundle outputs
+*.apk
+*.ap_
+*.aab
+
+# Keystore files should not be committed unless intentionally shared.
+*.jks
+*.keystore
+
+# Large local SDKs and native dependencies
+app/src/main/cpp/ncnn-android-vulkan/
+
+# Local screenshots or adb artifacts
+*.hprof
+*.trace

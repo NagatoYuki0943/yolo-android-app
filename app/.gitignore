@@ -1,1 +1,4 @@
 /build
+/src/main/cpp/ncnn-android-vulkan/
+/.cxx/
+/.externalNativeBuild/
