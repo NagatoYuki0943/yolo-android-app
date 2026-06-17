@@ -7,6 +7,7 @@
 #include <cstring>
 #include <jni.h>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -16,6 +17,11 @@
 #if NCNN_VULKAN
 #include "gpu.h"
 #endif
+
+extern "C" void omp_set_num_threads(int num_threads) __attribute__((weak));
+extern "C" void omp_set_dynamic(int dynamic) __attribute__((weak));
+extern "C" void kmp_set_blocktime(int blocktime) __attribute__((weak));
+extern "C" void kmp_set_defaults(char const* defaults) __attribute__((weak));
 
 namespace {
 
@@ -34,6 +40,27 @@ struct Detector {
     int inputHeight = 0;
     std::vector<std::string> labels;
 };
+
+void configureOpenMpRuntimeOnce() {
+    static std::once_flag onceFlag;
+    std::call_once(onceFlag, []() {
+        setenv("KMP_AFFINITY", "none", 1);
+        setenv("OMP_PROC_BIND", "FALSE", 1);
+        setenv("OMP_NUM_THREADS", "1", 1);
+        if (kmp_set_defaults != nullptr) {
+            kmp_set_defaults("KMP_AFFINITY=none");
+        }
+        if (omp_set_dynamic != nullptr) {
+            omp_set_dynamic(0);
+        }
+        if (omp_set_num_threads != nullptr) {
+            omp_set_num_threads(1);
+        }
+        if (kmp_set_blocktime != nullptr) {
+            kmp_set_blocktime(0);
+        }
+    });
+}
 
 void throwException(JNIEnv* env, const char* className, const std::string& message) {
     jclass clazz = env->FindClass(className);
@@ -309,6 +336,8 @@ Java_com_example_yolo_1app_detector_NcnnYoloDetector_nativeCreate(
         jstring binAssetPath,
         jstring metadataAssetPath,
         jboolean useVulkan) {
+    configureOpenMpRuntimeOnce();
+
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
     if (mgr == nullptr) {
         throwException(env, "java/lang/IllegalArgumentException", "AssetManager is null");
@@ -340,6 +369,7 @@ Java_com_example_yolo_1app_detector_NcnnYoloDetector_nativeCreate(
     detector->net.opt.use_fp16_storage = true;
     detector->net.opt.use_fp16_arithmetic = false;
     detector->net.opt.num_threads = 4;
+    detector->net.opt.openmp_blocktime = 0;
 #if NCNN_VULKAN
     detector->net.opt.use_vulkan_compute = useVulkan == JNI_TRUE;
 #else

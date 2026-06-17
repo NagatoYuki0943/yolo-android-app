@@ -70,6 +70,7 @@ import com.example.yolo_app.detector.Detection
 import com.example.yolo_app.detector.NcnnYoloDetector
 import com.example.yolo_app.ui.theme.YoloappTheme
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -222,6 +223,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
         )
     }
     val detectorHolder = remember(context) { DetectorHolder(context.applicationContext) }
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
         uri ?: return@rememberLauncherForActivityResult
@@ -235,19 +237,21 @@ fun YoloScreen(modifier: Modifier = Modifier) {
     }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         hasCameraPermission = granted
-        cameraRunning = granted
-        status = if (granted) "摄像头权限已授予，正在启动实时推理" else "需要摄像头权限才能实时推理"
+        cameraRunning = false
+        status = if (granted) "摄像头权限已授予，请手动开始摄像头推理" else "需要摄像头权限才能实时推理"
     }
 
     DisposableEffect(Unit) {
         onDispose {
             detectorHolder.close()
+            cameraExecutor.shutdown()
         }
     }
 
     if (mode == InferenceMode.Camera && hasCameraPermission) {
         CameraInferenceEffect(
             context = context,
+            cameraExecutor = cameraExecutor,
             detectorProvider = {
                 detectorHolder
             },
@@ -310,8 +314,8 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                         cameraRunning = false
                         permissionLauncher.launch(Manifest.permission.CAMERA)
                     } else {
-                        cameraRunning = true
-                        status = "正在启动摄像头"
+                        cameraRunning = false
+                        status = "摄像头推理已关闭，请手动开始"
                     }
                 },
             )
@@ -425,11 +429,13 @@ fun YoloScreen(modifier: Modifier = Modifier) {
         }
 
         val previewBitmap = if (mode == InferenceMode.Camera) cameraBitmap else imageBitmap
+        InferenceMetricsRow(
+            latencyMs = latencyMs,
+            fps = fps,
+        )
         DetectionPreview(
             bitmap = previewBitmap,
             detections = detections,
-            latencyMs = latencyMs,
-            fps = fps,
             modifier = previewBitmap.previewModifier(),
         )
 
@@ -497,6 +503,7 @@ private fun ThresholdSlider(
 @Composable
 private fun CameraInferenceEffect(
     context: Context,
+    cameraExecutor: ExecutorService,
     detectorProvider: () -> DetectorHolder,
     enabled: Boolean,
     options: InferenceOptions,
@@ -514,10 +521,10 @@ private fun CameraInferenceEffect(
 
     DisposableEffect(context) {
         val lifecycleOwner = context as LifecycleOwner
-        val cameraExecutor = Executors.newSingleThreadExecutor()
         val mainHandler = Handler(Looper.getMainLooper())
         val isActive = AtomicBoolean(true)
         val isDetecting = AtomicBoolean(false)
+        val analysisRef = AtomicReference<ImageAnalysis?>(null)
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
 
         cameraProviderFuture.addListener(
@@ -532,6 +539,7 @@ private fun CameraInferenceEffect(
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                         .build()
+                    analysisRef.set(analysis)
 
                     analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                         if (!isActive.get() || !latestEnabled.get() || !isDetecting.compareAndSet(false, true)) {
@@ -584,20 +592,37 @@ private fun CameraInferenceEffect(
 
         onDispose {
             isActive.set(false)
+            analysisRef.get()?.clearAnalyzer()
             if (cameraProviderFuture.isDone) {
                 cameraProviderFuture.get().unbindAll()
             }
-            cameraExecutor.shutdown()
         }
     }
+}
+
+@Composable
+private fun InferenceMetricsRow(
+    latencyMs: Float?,
+    fps: Float?,
+) {
+    val metrics = buildString {
+        append("推理耗时：")
+        if (latencyMs == null) {
+            append("-- ms")
+        } else {
+            append("${"%.1f".format(latencyMs)} ms")
+        }
+        fps?.let {
+            append("    FPS：${"%.1f".format(it)}")
+        }
+    }
+    Text(text = metrics, style = MaterialTheme.typography.bodyMedium)
 }
 
 @Composable
 private fun DetectionPreview(
     bitmap: Bitmap?,
     detections: List<Detection>,
-    latencyMs: Float?,
-    fps: Float?,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier, contentAlignment = Alignment.Center) {
@@ -615,8 +640,6 @@ private fun DetectionPreview(
         DetectionOverlay(
             bitmap = bitmap,
             detections = detections,
-            latencyMs = latencyMs,
-            fps = fps,
             modifier = Modifier.fillMaxSize(),
         )
     }
@@ -626,8 +649,6 @@ private fun DetectionPreview(
 private fun DetectionOverlay(
     bitmap: Bitmap,
     detections: List<Detection>,
-    latencyMs: Float?,
-    fps: Float?,
     modifier: Modifier = Modifier,
 ) {
     Canvas(modifier = modifier) {
@@ -664,17 +685,6 @@ private fun DetectionOverlay(
                 left = left,
                 top = top,
             )
-        }
-
-        val metrics = buildString {
-            latencyMs?.let { append("Infer ${"%.1f".format(it)} ms") }
-            fps?.let {
-                if (isNotEmpty()) append("  ")
-                append("FPS ${"%.1f".format(it)}")
-            }
-        }
-        if (metrics.isNotEmpty()) {
-            drawLabel(text = metrics, left = offsetX + 8.dp.toPx(), top = offsetY + 8.dp.toPx())
         }
     }
 }
