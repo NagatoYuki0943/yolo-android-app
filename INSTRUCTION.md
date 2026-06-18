@@ -13,3 +13,5 @@ yolo 模型权重存放位置 `C:\ml\code\dl\yolo\weights`
 我想使用 ncnn 和 onnxruntime 实现在安卓的 GPU、CPU 上运行 yolo 模型。
 
 powershell 代理 `$env:hTTP_PROXY="http://127.0.0.1:7890"; $env:HTTPS_PROXY="http://127.0.0.1:7890"`
+
+需要手机调试可以通知我，我来负责打开软件、截屏等操作。
