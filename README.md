@@ -93,10 +93,19 @@ app/src/main/cpp/ncnn-android-vulkan/
 
 ### ncnn 模型
 
-当前 ncnn 模型资产目录：
+当前 ncnn float32 模型资产目录：
 
 ```text
 app/src/main/assets/yolo26n_ncnn_model/
+  model.ncnn.param
+  model.ncnn.bin
+  metadata.yaml
+```
+
+当前 ncnn int8 量化模型资产目录：
+
+```text
+app/src/main/assets/yolo26n_ncnn_model_int8/
   model.ncnn.param
   model.ncnn.bin
   metadata.yaml
@@ -106,6 +115,8 @@ app/src/main/assets/yolo26n_ncnn_model/
 
 - `imgsz`：模型输入尺寸，例如 `[640, 640]`
 - `names`：类别 id 到类别名的映射
+
+界面在 ncnn 后端下支持 `float32 / int8` 模型类型切换。切换模型类型时会销毁当前 ncnn detector 并重新加载对应 assets 目录中的模型。
 
 ncnn JNI 包装类：
 
@@ -117,6 +128,50 @@ C++ ncnn 实现：
 
 ```text
 app/src/main/cpp/ncnn_yolo_jni.cpp
+```
+
+### ncnn int8 量化
+
+ncnn int8 量化参考官方文档：
+
+- [quantized-int8-inference.md](https://github.com/Tencent/ncnn/blob/master/docs/how-to-use-and-FAQ/quantized-int8-inference.md)
+
+量化工具来自 ncnn `20260526` release 的 Windows 预编译包：
+
+- [ncnn 20260526 release](https://github.com/Tencent/ncnn/releases/tag/20260526)
+- [ncnn-20260526-windows-vs2022.zip](https://github.com/Tencent/ncnn/releases/download/20260526/ncnn-20260526-windows-vs2022.zip)
+
+使用到的工具：
+
+- `ncnn2table.exe`
+- `ncnn2int8.exe`
+
+示例量化流程：
+
+```powershell
+# 一般标准化的计算是 (x - mean) / norm
+# 而 ncnn 标准化是 (x - mean) * norm
+# yolo 标准化的 mean = [0,0,0], norm = [255,255,255]
+# 在这里就是 mean = [0,0,0], norm = [0.003922,0.003922,0.003922] # 0.003922 ≈ 1 / 255
+.\ncnn2table.exe model.ncnn.param model.ncnn.bin imagelist.txt model.ncnn.table mean=[0,0,0] norm=[0.003922,0.003922,0.003922] shape=[640,640,3] pixel=RGB thread=8 method=kl
+```
+
+```powershell
+.\ncnn2int8.exe model.ncnn.param model.ncnn.bin model.ncnn-int8.param model.ncnn-int8.bin model.ncnn.table
+```
+
+生成后将 int8 模型复制到：
+
+```text
+app/src/main/assets/yolo26n_ncnn_model_int8/
+```
+
+并保持 App 期望的文件名：
+
+```text
+model.ncnn.param
+model.ncnn.bin
+metadata.yaml
 ```
 
 ### ONNX Runtime 模型

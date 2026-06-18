@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.example.yolo_app.detector.Detection
+import com.example.yolo_app.detector.NcnnModelType
 import com.example.yolo_app.detector.NcnnYoloDetector
 import com.example.yolo_app.detector.OnnxYoloDetector
 import com.example.yolo_app.ui.theme.YoloappTheme
@@ -122,17 +123,23 @@ private enum class InferenceEngine(
     Onnx("ONNX Runtime"),
 }
 
+private fun NcnnModelType.displaySuffix(engine: InferenceEngine): String {
+    return if (engine == InferenceEngine.Ncnn) "$displayName " else ""
+}
+
 private data class TimedDetectionResult(
     val detections: List<Detection>,
     val elapsedMs: Float,
     val engine: InferenceEngine,
     val device: InferenceDevice,
+    val ncnnModelType: NcnnModelType,
     val fallbackMessage: String? = null,
 )
 
 private data class InferenceOptions(
     val engine: InferenceEngine,
     val device: InferenceDevice,
+    val ncnnModelType: NcnnModelType,
     val scoreThreshold: Float,
     val iouThreshold: Float,
 )
@@ -143,6 +150,7 @@ private class DetectorHolder(
     private var detector: ActiveDetector? = null
     private var engine: InferenceEngine? = null
     private var device: InferenceDevice? = null
+    private var ncnnModelType: NcnnModelType? = null
     private val unavailableGpuMessages = mutableMapOf<InferenceEngine, String>()
 
     @Synchronized
@@ -151,6 +159,7 @@ private class DetectorHolder(
         detector = null
         engine = null
         device = null
+        ncnnModelType = null
     }
 
     @Synchronized
@@ -158,6 +167,7 @@ private class DetectorHolder(
         bitmap: Bitmap,
         requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
+        requestedNcnnModelType: NcnnModelType,
         scoreThreshold: Float,
         iouThreshold: Float,
     ): TimedDetectionResult {
@@ -165,6 +175,7 @@ private class DetectorHolder(
             bitmap = bitmap,
             requestedEngine = requestedEngine,
             requestedDevice = requestedDevice,
+            requestedNcnnModelType = requestedNcnnModelType,
             scoreThreshold = scoreThreshold,
             iouThreshold = iouThreshold,
             fallbackMessage = null,
@@ -180,6 +191,7 @@ private class DetectorHolder(
         bitmap: Bitmap,
         requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
+        requestedNcnnModelType: NcnnModelType,
         scoreThreshold: Float,
         iouThreshold: Float,
         fallbackMessage: String?,
@@ -191,6 +203,7 @@ private class DetectorHolder(
                     bitmap = bitmap,
                     requestedEngine = requestedEngine,
                     requestedDevice = InferenceDevice.Cpu,
+                    requestedNcnnModelType = requestedNcnnModelType,
                     scoreThreshold = scoreThreshold,
                     iouThreshold = iouThreshold,
                     fallbackMessage = unavailableMessage,
@@ -199,7 +212,7 @@ private class DetectorHolder(
         }
 
         return try {
-            val activeDetector = ensureDetector(requestedEngine, requestedDevice)
+            val activeDetector = ensureDetector(requestedEngine, requestedDevice, requestedNcnnModelType)
             val startNs = SystemClock.elapsedRealtimeNanos()
             val detections = activeDetector.detect(
                 bitmap = bitmap,
@@ -212,6 +225,7 @@ private class DetectorHolder(
                 elapsedMs = elapsedMs,
                 engine = requestedEngine,
                 device = requestedDevice,
+                ncnnModelType = requestedNcnnModelType,
                 fallbackMessage = fallbackMessage,
             )
         } catch (error: Throwable) {
@@ -225,6 +239,7 @@ private class DetectorHolder(
                     bitmap = bitmap,
                     requestedEngine = requestedEngine,
                     requestedDevice = InferenceDevice.Cpu,
+                    requestedNcnnModelType = requestedNcnnModelType,
                     scoreThreshold = scoreThreshold,
                     iouThreshold = iouThreshold,
                     fallbackMessage = message,
@@ -238,16 +253,22 @@ private class DetectorHolder(
     private fun ensureDetector(
         requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
+        requestedNcnnModelType: NcnnModelType,
     ): ActiveDetector {
         val activeDetector = detector
-        if (activeDetector != null && engine == requestedEngine && device == requestedDevice) {
+        val ncnnModelMatches = requestedEngine != InferenceEngine.Ncnn || ncnnModelType == requestedNcnnModelType
+        if (activeDetector != null && engine == requestedEngine && device == requestedDevice && ncnnModelMatches) {
             return activeDetector
         }
 
         closeCurrent()
         val createdDetector = when (requestedEngine) {
             InferenceEngine.Ncnn -> ActiveDetector.Ncnn(
-                NcnnYoloDetector(context, useGpu = requestedDevice.useGpu),
+                NcnnYoloDetector(
+                    context = context,
+                    useGpu = requestedDevice.useGpu,
+                    modelType = requestedNcnnModelType,
+                ),
             )
             InferenceEngine.Onnx -> ActiveDetector.Onnx(
                 OnnxYoloDetector(context, useNnapi = requestedDevice.useGpu),
@@ -257,6 +278,7 @@ private class DetectorHolder(
             detector = it
             engine = requestedEngine
             device = requestedDevice
+            ncnnModelType = if (requestedEngine == InferenceEngine.Ncnn) requestedNcnnModelType else null
         }
     }
 
@@ -306,6 +328,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
     var cameraRunning by remember { mutableStateOf(false) }
     var inferenceEngine by remember { mutableStateOf(InferenceEngine.Ncnn) }
     var inferenceDevice by remember { mutableStateOf(InferenceDevice.Gpu) }
+    var ncnnModelType by remember { mutableStateOf(NcnnModelType.Float32) }
     var scoreThreshold by remember { mutableStateOf(0.35f) }
     var iouThreshold by remember { mutableStateOf(0.45f) }
     var showThresholds by remember { mutableStateOf(false) }
@@ -352,6 +375,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
             options = InferenceOptions(
                 engine = inferenceEngine,
                 device = inferenceDevice,
+                ncnnModelType = ncnnModelType,
                 scoreThreshold = scoreThreshold,
                 iouThreshold = iouThreshold,
             ),
@@ -364,7 +388,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                     inferenceDevice = result.device
                 }
                 status = result.fallbackMessage
-                    ?: "实时推理中：${result.detections.size} 个目标，${result.engine.displayName} ${result.device.displayNameFor(result.engine)}"
+                    ?: "实时推理中：${result.detections.size} 个目标，${result.engine.displayName} ${result.ncnnModelType.displaySuffix(result.engine)}${result.device.displayNameFor(result.engine)}"
             },
             onError = { error ->
                 status = error.message ?: error.javaClass.simpleName
@@ -437,6 +461,32 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                         }
                     },
                 )
+            }
+        }
+
+        if (inferenceEngine == InferenceEngine.Ncnn) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                NcnnModelType.entries.forEach { modelType ->
+                    ModeButton(
+                        text = modelType.displayName,
+                        selected = ncnnModelType == modelType,
+                        onClick = {
+                            if (ncnnModelType != modelType) {
+                                ncnnModelType = modelType
+                                if (mode != InferenceMode.Camera) {
+                                    detectorHolder.closeCurrent()
+                                }
+                                latencyMs = null
+                                fps = null
+                                status = if (mode == InferenceMode.Camera) {
+                                    "将从下一帧切换到 ncnn ${modelType.displayName}"
+                                } else {
+                                    "已切换到 ncnn ${modelType.displayName}"
+                                }
+                            }
+                        },
+                    )
+                }
             }
         }
 
@@ -524,6 +574,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                                     bitmap = source,
                                     requestedEngine = inferenceEngine,
                                     requestedDevice = inferenceDevice,
+                                    requestedNcnnModelType = ncnnModelType,
                                     scoreThreshold = scoreThreshold,
                                     iouThreshold = iouThreshold,
                                 )
@@ -534,7 +585,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                                     inferenceDevice = result.device
                                 }
                                 status = result.fallbackMessage
-                                    ?: "图片检测完成：${result.detections.size} 个目标，${result.engine.displayName} ${result.device.displayNameFor(result.engine)}，${"%.1f".format(result.elapsedMs)} ms"
+                                    ?: "图片检测完成：${result.detections.size} 个目标，${result.engine.displayName} ${result.ncnnModelType.displaySuffix(result.engine)}${result.device.displayNameFor(result.engine)}，${"%.1f".format(result.elapsedMs)} ms"
                             } catch (error: Throwable) {
                                 status = error.message ?: error.javaClass.simpleName
                             }
@@ -672,6 +723,7 @@ private fun CameraInferenceEffect(
                                 bitmap = bitmap,
                                 requestedEngine = currentOptions.engine,
                                 requestedDevice = currentOptions.device,
+                                requestedNcnnModelType = currentOptions.ncnnModelType,
                                 scoreThreshold = currentOptions.scoreThreshold,
                                 iouThreshold = currentOptions.iouThreshold,
                             )

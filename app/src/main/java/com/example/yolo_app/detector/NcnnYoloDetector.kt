@@ -3,18 +3,27 @@ package com.example.yolo_app.detector
 import android.content.Context
 import android.graphics.Bitmap
 
+enum class NcnnModelType(
+    val displayName: String,
+    val assetDir: String,
+) {
+    Float32("float32", "yolo26n_ncnn_model"),
+    Int8("int8", "yolo26n_ncnn_model_int8"),
+}
+
 class NcnnYoloDetector(
     context: Context,
     val useGpu: Boolean = true,
+    val modelType: NcnnModelType = NcnnModelType.Float32,
 ) : AutoCloseable {
     private var nativeHandle: Long = 0L
 
     init {
         nativeHandle = nativeCreate(
             context.assets,
-            "yolo26n_ncnn_model/model.ncnn.param",
-            "yolo26n_ncnn_model/model.ncnn.bin",
-            "yolo26n_ncnn_model/metadata.yaml",
+            "${modelType.assetDir}/model.ncnn.param",
+            "${modelType.assetDir}/model.ncnn.bin",
+            "${modelType.assetDir}/metadata.yaml",
             useGpu,
         )
     }
