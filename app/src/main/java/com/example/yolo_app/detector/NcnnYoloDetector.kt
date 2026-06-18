@@ -17,6 +17,7 @@ class NcnnYoloDetector(
     val modelType: NcnnModelType = NcnnModelType.Float32,
 ) : AutoCloseable {
     private var nativeHandle: Long = 0L
+    val outputFormat: YoloOutputFormat = parseOutputFormat(context, modelType)
 
     init {
         nativeHandle = nativeCreate(
@@ -65,6 +66,22 @@ class NcnnYoloDetector(
     companion object {
         init {
             System.loadLibrary("yolo_ncnn")
+        }
+
+        private fun parseOutputFormat(context: Context, modelType: NcnnModelType): YoloOutputFormat {
+            val metadataPath = "${modelType.assetDir}/metadata.yaml"
+            val yaml = context.assets.open(metadataPath).bufferedReader().use { it.readText() }
+            val endToEnd = yaml.lineSequence()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("end2end:") }
+                ?.substringAfter(":")
+                ?.trim()
+                ?.equals("true", ignoreCase = true)
+            return when (endToEnd) {
+                true -> YoloOutputFormat.EndToEnd
+                false -> YoloOutputFormat.Raw
+                null -> YoloOutputFormat.Unknown
+            }
         }
     }
 }

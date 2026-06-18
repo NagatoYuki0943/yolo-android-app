@@ -67,9 +67,12 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.example.yolo_app.detector.Detection
+import com.example.yolo_app.detector.LiteRtModelType
+import com.example.yolo_app.detector.LiteRtYoloDetector
 import com.example.yolo_app.detector.NcnnModelType
 import com.example.yolo_app.detector.NcnnYoloDetector
 import com.example.yolo_app.detector.OnnxYoloDetector
+import com.example.yolo_app.detector.YoloOutputFormat
 import com.example.yolo_app.ui.theme.YoloappTheme
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
@@ -109,7 +112,7 @@ private enum class InferenceDevice(
 }
 
 private fun InferenceDevice.displayNameFor(engine: InferenceEngine): String {
-    return if (engine == InferenceEngine.Onnx && this == InferenceDevice.Gpu) {
+    return if ((engine == InferenceEngine.Onnx || engine == InferenceEngine.LiteRt) && this == InferenceDevice.Gpu) {
         "NNAPI"
     } else {
         displayName
@@ -121,10 +124,23 @@ private enum class InferenceEngine(
 ) {
     Ncnn("ncnn"),
     Onnx("ONNX Runtime"),
+    LiteRt("LiteRT"),
 }
 
-private fun NcnnModelType.displaySuffix(engine: InferenceEngine): String {
-    return if (engine == InferenceEngine.Ncnn) "$displayName " else ""
+private fun modelDescription(
+    engine: InferenceEngine,
+    device: InferenceDevice,
+    ncnnModelType: NcnnModelType,
+    liteRtModelType: LiteRtModelType,
+    outputFormat: YoloOutputFormat,
+): String {
+    val deviceText = device.displayNameFor(engine)
+    val formatText = outputFormat.displayName
+    return when (engine) {
+        InferenceEngine.Ncnn -> "YOLO26n ncnn ${ncnnModelType.displayName} $deviceText $formatText"
+        InferenceEngine.Onnx -> "YOLO26n ONNX Runtime float32 $deviceText $formatText"
+        InferenceEngine.LiteRt -> "YOLO26n LiteRT ${liteRtModelType.displayName} $deviceText $formatText"
+    }
 }
 
 private data class TimedDetectionResult(
@@ -133,6 +149,8 @@ private data class TimedDetectionResult(
     val engine: InferenceEngine,
     val device: InferenceDevice,
     val ncnnModelType: NcnnModelType,
+    val liteRtModelType: LiteRtModelType,
+    val outputFormat: YoloOutputFormat,
     val fallbackMessage: String? = null,
 )
 
@@ -140,6 +158,7 @@ private data class InferenceOptions(
     val engine: InferenceEngine,
     val device: InferenceDevice,
     val ncnnModelType: NcnnModelType,
+    val liteRtModelType: LiteRtModelType,
     val scoreThreshold: Float,
     val iouThreshold: Float,
 )
@@ -151,6 +170,7 @@ private class DetectorHolder(
     private var engine: InferenceEngine? = null
     private var device: InferenceDevice? = null
     private var ncnnModelType: NcnnModelType? = null
+    private var liteRtModelType: LiteRtModelType? = null
     private val unavailableGpuMessages = mutableMapOf<InferenceEngine, String>()
 
     @Synchronized
@@ -160,6 +180,7 @@ private class DetectorHolder(
         engine = null
         device = null
         ncnnModelType = null
+        liteRtModelType = null
     }
 
     @Synchronized
@@ -168,6 +189,7 @@ private class DetectorHolder(
         requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
         requestedNcnnModelType: NcnnModelType,
+        requestedLiteRtModelType: LiteRtModelType,
         scoreThreshold: Float,
         iouThreshold: Float,
     ): TimedDetectionResult {
@@ -176,6 +198,7 @@ private class DetectorHolder(
             requestedEngine = requestedEngine,
             requestedDevice = requestedDevice,
             requestedNcnnModelType = requestedNcnnModelType,
+            requestedLiteRtModelType = requestedLiteRtModelType,
             scoreThreshold = scoreThreshold,
             iouThreshold = iouThreshold,
             fallbackMessage = null,
@@ -192,6 +215,7 @@ private class DetectorHolder(
         requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
         requestedNcnnModelType: NcnnModelType,
+        requestedLiteRtModelType: LiteRtModelType,
         scoreThreshold: Float,
         iouThreshold: Float,
         fallbackMessage: String?,
@@ -204,6 +228,7 @@ private class DetectorHolder(
                     requestedEngine = requestedEngine,
                     requestedDevice = InferenceDevice.Cpu,
                     requestedNcnnModelType = requestedNcnnModelType,
+                    requestedLiteRtModelType = requestedLiteRtModelType,
                     scoreThreshold = scoreThreshold,
                     iouThreshold = iouThreshold,
                     fallbackMessage = unavailableMessage,
@@ -212,7 +237,12 @@ private class DetectorHolder(
         }
 
         return try {
-            val activeDetector = ensureDetector(requestedEngine, requestedDevice, requestedNcnnModelType)
+            val activeDetector = ensureDetector(
+                requestedEngine,
+                requestedDevice,
+                requestedNcnnModelType,
+                requestedLiteRtModelType,
+            )
             val startNs = SystemClock.elapsedRealtimeNanos()
             val detections = activeDetector.detect(
                 bitmap = bitmap,
@@ -226,13 +256,15 @@ private class DetectorHolder(
                 engine = requestedEngine,
                 device = requestedDevice,
                 ncnnModelType = requestedNcnnModelType,
+                liteRtModelType = requestedLiteRtModelType,
+                outputFormat = activeDetector.outputFormat,
                 fallbackMessage = fallbackMessage,
             )
         } catch (error: Throwable) {
             closeCurrent()
             if (requestedDevice == InferenceDevice.Gpu) {
                 val message = gpuFallbackMessage(requestedEngine, error)
-                if (requestedEngine == InferenceEngine.Onnx) {
+                if (requestedEngine == InferenceEngine.Onnx || requestedEngine == InferenceEngine.LiteRt) {
                     unavailableGpuMessages[requestedEngine] = message
                 }
                 tryDetect(
@@ -240,6 +272,7 @@ private class DetectorHolder(
                     requestedEngine = requestedEngine,
                     requestedDevice = InferenceDevice.Cpu,
                     requestedNcnnModelType = requestedNcnnModelType,
+                    requestedLiteRtModelType = requestedLiteRtModelType,
                     scoreThreshold = scoreThreshold,
                     iouThreshold = iouThreshold,
                     fallbackMessage = message,
@@ -254,10 +287,18 @@ private class DetectorHolder(
         requestedEngine: InferenceEngine,
         requestedDevice: InferenceDevice,
         requestedNcnnModelType: NcnnModelType,
+        requestedLiteRtModelType: LiteRtModelType,
     ): ActiveDetector {
         val activeDetector = detector
         val ncnnModelMatches = requestedEngine != InferenceEngine.Ncnn || ncnnModelType == requestedNcnnModelType
-        if (activeDetector != null && engine == requestedEngine && device == requestedDevice && ncnnModelMatches) {
+        val liteRtModelMatches = requestedEngine != InferenceEngine.LiteRt || liteRtModelType == requestedLiteRtModelType
+        if (
+            activeDetector != null &&
+            engine == requestedEngine &&
+            device == requestedDevice &&
+            ncnnModelMatches &&
+            liteRtModelMatches
+        ) {
             return activeDetector
         }
 
@@ -273,19 +314,31 @@ private class DetectorHolder(
             InferenceEngine.Onnx -> ActiveDetector.Onnx(
                 OnnxYoloDetector(context, useNnapi = requestedDevice.useGpu),
             )
+            InferenceEngine.LiteRt -> ActiveDetector.LiteRt(
+                LiteRtYoloDetector(
+                    context = context,
+                    useNnapi = requestedDevice.useGpu,
+                    modelType = requestedLiteRtModelType,
+                ),
+            )
         }
         return createdDetector.also {
             detector = it
             engine = requestedEngine
             device = requestedDevice
             ncnnModelType = if (requestedEngine == InferenceEngine.Ncnn) requestedNcnnModelType else null
+            liteRtModelType = if (requestedEngine == InferenceEngine.LiteRt) requestedLiteRtModelType else null
         }
     }
 
     private sealed class ActiveDetector : AutoCloseable {
+        abstract val outputFormat: YoloOutputFormat
         abstract fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection>
 
         class Ncnn(private val detector: NcnnYoloDetector) : ActiveDetector() {
+            override val outputFormat: YoloOutputFormat
+                get() = detector.outputFormat
+
             override fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection> {
                 return detector.detect(bitmap, scoreThreshold, nmsThreshold)
             }
@@ -294,6 +347,20 @@ private class DetectorHolder(
         }
 
         class Onnx(private val detector: OnnxYoloDetector) : ActiveDetector() {
+            override val outputFormat: YoloOutputFormat
+                get() = detector.outputFormat
+
+            override fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection> {
+                return detector.detect(bitmap, scoreThreshold, nmsThreshold)
+            }
+
+            override fun close() = detector.close()
+        }
+
+        class LiteRt(private val detector: LiteRtYoloDetector) : ActiveDetector() {
+            override val outputFormat: YoloOutputFormat
+                get() = detector.outputFormat
+
             override fun detect(bitmap: Bitmap, scoreThreshold: Float, nmsThreshold: Float): List<Detection> {
                 return detector.detect(bitmap, scoreThreshold, nmsThreshold)
             }
@@ -312,7 +379,41 @@ private fun gpuFallbackMessage(engine: InferenceEngine, error: Throwable): Strin
             "ONNX Runtime NNAPI 加速不可用，已切换到 CPU：${detail.take(80)}"
         }
     }
+    if (engine == InferenceEngine.LiteRt) {
+        return "LiteRT NNAPI 加速不可用，已切换到 CPU：${detail.take(80)}"
+    }
     return "${engine.displayName} GPU 推理失败，已切换到 CPU：${detail.take(80)}"
+}
+
+private fun defaultOutputFormatForSelection(
+    context: Context,
+    engine: InferenceEngine,
+    ncnnModelType: NcnnModelType,
+    liteRtModelType: LiteRtModelType,
+): YoloOutputFormat {
+    return when (engine) {
+        InferenceEngine.Ncnn -> readMetadataOutputFormat(context, "${ncnnModelType.assetDir}/metadata.yaml")
+        InferenceEngine.LiteRt -> readMetadataOutputFormat(context, "${liteRtModelType.assetDir}/metadata.yaml")
+        InferenceEngine.Onnx -> YoloOutputFormat.Unknown
+    }
+}
+
+private fun readMetadataOutputFormat(context: Context, assetPath: String): YoloOutputFormat {
+    return runCatching {
+        val yaml = context.assets.open(assetPath).bufferedReader().use { it.readText() }
+        yaml.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("end2end:") }
+            ?.substringAfter(":")
+            ?.trim()
+            ?.equals("true", ignoreCase = true)
+    }.getOrNull().let { endToEnd ->
+        when (endToEnd) {
+            true -> YoloOutputFormat.EndToEnd
+            false -> YoloOutputFormat.Raw
+            null -> YoloOutputFormat.Unknown
+        }
+    }
 }
 
 @Composable
@@ -322,13 +423,24 @@ fun YoloScreen(modifier: Modifier = Modifier) {
     var imageBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var cameraBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var detections by remember { mutableStateOf<List<Detection>>(emptyList()) }
-    var status by remember { mutableStateOf("选择图片或切换到摄像头实时推理") }
+    var status by remember { mutableStateOf("") }
     var latencyMs by remember { mutableStateOf<Float?>(null) }
     var fps by remember { mutableStateOf<Float?>(null) }
     var cameraRunning by remember { mutableStateOf(false) }
     var inferenceEngine by remember { mutableStateOf(InferenceEngine.Ncnn) }
     var inferenceDevice by remember { mutableStateOf(InferenceDevice.Gpu) }
     var ncnnModelType by remember { mutableStateOf(NcnnModelType.Float32) }
+    var liteRtModelType by remember { mutableStateOf(LiteRtModelType.Float32) }
+    var modelOutputFormat by remember {
+        mutableStateOf(
+            defaultOutputFormatForSelection(
+                context,
+                InferenceEngine.Ncnn,
+                NcnnModelType.Float32,
+                LiteRtModelType.Float32,
+            ),
+        )
+    }
     var scoreThreshold by remember { mutableStateOf(0.35f) }
     var iouThreshold by remember { mutableStateOf(0.45f) }
     var showThresholds by remember { mutableStateOf(false) }
@@ -376,6 +488,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                 engine = inferenceEngine,
                 device = inferenceDevice,
                 ncnnModelType = ncnnModelType,
+                liteRtModelType = liteRtModelType,
                 scoreThreshold = scoreThreshold,
                 iouThreshold = iouThreshold,
             ),
@@ -384,11 +497,12 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                 detections = result.detections
                 latencyMs = result.elapsedMs
                 fps = if (result.elapsedMs > 0.0f) 1000.0f / result.elapsedMs else null
+                modelOutputFormat = result.outputFormat
                 if (result.fallbackMessage != null && result.device != inferenceDevice) {
                     inferenceDevice = result.device
                 }
                 status = result.fallbackMessage
-                    ?: "实时推理中：${result.detections.size} 个目标，${result.engine.displayName} ${result.ncnnModelType.displaySuffix(result.engine)}${result.device.displayNameFor(result.engine)}"
+                    ?: "实时推理中：${result.detections.size} 个目标"
             },
             onError = { error ->
                 status = error.message ?: error.javaClass.simpleName
@@ -404,7 +518,10 @@ fun YoloScreen(modifier: Modifier = Modifier) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(text = "YOLO Demo", style = MaterialTheme.typography.headlineSmall)
-        Text(text = status, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            text = "当前模型：${modelDescription(inferenceEngine, inferenceDevice, ncnnModelType, liteRtModelType, modelOutputFormat)}",
+            style = MaterialTheme.typography.bodyMedium,
+        )
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             ModeButton(
@@ -417,7 +534,7 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                     detections = emptyList()
                     latencyMs = null
                     fps = null
-                    status = "图片模式"
+                    status = ""
                 },
             )
             ModeButton(
@@ -448,6 +565,12 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                     onClick = {
                         if (inferenceEngine != engine) {
                             inferenceEngine = engine
+                            modelOutputFormat = defaultOutputFormatForSelection(
+                                context,
+                                engine,
+                                ncnnModelType,
+                                liteRtModelType,
+                            )
                             if (mode != InferenceMode.Camera) {
                                 detectorHolder.closeCurrent()
                             }
@@ -473,6 +596,12 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                         onClick = {
                             if (ncnnModelType != modelType) {
                                 ncnnModelType = modelType
+                                modelOutputFormat = defaultOutputFormatForSelection(
+                                    context,
+                                    inferenceEngine,
+                                    modelType,
+                                    liteRtModelType,
+                                )
                                 if (mode != InferenceMode.Camera) {
                                     detectorHolder.closeCurrent()
                                 }
@@ -482,6 +611,48 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                                     "将从下一帧切换到 ncnn ${modelType.displayName}"
                                 } else {
                                     "已切换到 ncnn ${modelType.displayName}"
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+        }
+
+        if (inferenceEngine == InferenceEngine.Onnx) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ModeButton(
+                    text = "float32",
+                    selected = true,
+                    onClick = {},
+                )
+            }
+        }
+
+        if (inferenceEngine == InferenceEngine.LiteRt) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiteRtModelType.entries.forEach { modelType ->
+                    ModeButton(
+                        text = modelType.displayName,
+                        selected = liteRtModelType == modelType,
+                        onClick = {
+                            if (liteRtModelType != modelType) {
+                                liteRtModelType = modelType
+                                modelOutputFormat = defaultOutputFormatForSelection(
+                                    context,
+                                    inferenceEngine,
+                                    ncnnModelType,
+                                    modelType,
+                                )
+                                if (mode != InferenceMode.Camera) {
+                                    detectorHolder.closeCurrent()
+                                }
+                                latencyMs = null
+                                fps = null
+                                status = if (mode == InferenceMode.Camera) {
+                                    "将从下一帧切换到 LiteRT ${modelType.displayName}"
+                                } else {
+                                    "已切换到 LiteRT ${modelType.displayName}"
                                 }
                             }
                         },
@@ -575,17 +746,19 @@ fun YoloScreen(modifier: Modifier = Modifier) {
                                     requestedEngine = inferenceEngine,
                                     requestedDevice = inferenceDevice,
                                     requestedNcnnModelType = ncnnModelType,
+                                    requestedLiteRtModelType = liteRtModelType,
                                     scoreThreshold = scoreThreshold,
                                     iouThreshold = iouThreshold,
                                 )
                                 detections = result.detections
                                 latencyMs = result.elapsedMs
                                 fps = null
+                                modelOutputFormat = result.outputFormat
                                 if (result.fallbackMessage != null && result.device != inferenceDevice) {
                                     inferenceDevice = result.device
                                 }
                                 status = result.fallbackMessage
-                                    ?: "图片检测完成：${result.detections.size} 个目标，${result.engine.displayName} ${result.ncnnModelType.displaySuffix(result.engine)}${result.device.displayNameFor(result.engine)}，${"%.1f".format(result.elapsedMs)} ms"
+                                    ?: "图片检测完成：${result.detections.size} 个目标"
                             } catch (error: Throwable) {
                                 status = error.message ?: error.javaClass.simpleName
                             }
@@ -598,6 +771,9 @@ fun YoloScreen(modifier: Modifier = Modifier) {
         }
 
         val previewBitmap = if (mode == InferenceMode.Camera) cameraBitmap else imageBitmap
+        if (status.isNotBlank()) {
+            Text(text = status, style = MaterialTheme.typography.bodyMedium)
+        }
         InferenceMetricsRow(
             latencyMs = latencyMs,
             fps = fps,
@@ -724,6 +900,7 @@ private fun CameraInferenceEffect(
                                 requestedEngine = currentOptions.engine,
                                 requestedDevice = currentOptions.device,
                                 requestedNcnnModelType = currentOptions.ncnnModelType,
+                                requestedLiteRtModelType = currentOptions.liteRtModelType,
                                 scoreThreshold = currentOptions.scoreThreshold,
                                 iouThreshold = currentOptions.iouThreshold,
                             )

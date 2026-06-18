@@ -35,6 +35,8 @@ class OnnxYoloDetector(
     private val inputHeight: Int
     private val labels: List<String>
     private val endToEnd: Boolean
+    var outputFormat: YoloOutputFormat = YoloOutputFormat.Unknown
+        private set
 
     init {
         val metadata = session.metadata.customMetadata
@@ -60,6 +62,7 @@ class OnnxYoloDetector(
             session.run(mapOf(inputName to inputTensor), setOf(outputName)).use { result ->
                 val outputTensor = result[0] as OnnxTensor
                 val shape = outputTensor.info.shape
+                outputFormat = inferOutputFormat(shape, labels.size)
                 val output = FloatArray(outputTensor.floatBuffer.remaining())
                 outputTensor.floatBuffer.get(output)
                 return parseOutput(
@@ -318,6 +321,17 @@ class OnnxYoloDetector(
             val labels = MutableList((namesById.keys.maxOrNull() ?: -1) + 1) { "" }
             namesById.forEach { (id, name) -> labels[id] = name }
             return labels
+        }
+
+        private fun inferOutputFormat(shape: LongArray?, classCount: Int): YoloOutputFormat {
+            val dims = shape?.filter { it > 0L }?.map { it.toInt() }.orEmpty()
+            val lastTwo = dims.takeLast(2)
+            val outputChannels = 4 + classCount
+            return when {
+                lastTwo.firstOrNull() == outputChannels || lastTwo.getOrNull(1) == outputChannels -> YoloOutputFormat.Raw
+                lastTwo.lastOrNull() == 6 -> YoloOutputFormat.EndToEnd
+                else -> YoloOutputFormat.Unknown
+            }
         }
 
         private fun nonMaxSuppression(detections: List<Detection>, threshold: Float): List<Detection> {

@@ -214,6 +214,54 @@ void nmsSortedBboxes(const std::vector<Object>& objects, std::vector<int>& picke
     }
 }
 
+Object makeObjectFromXyxy(
+        float left,
+        float top,
+        float right,
+        float bottom,
+        int label,
+        float score,
+        int imageWidth,
+        int imageHeight,
+        float scale,
+        float padX,
+        float padY) {
+    Object obj{};
+    obj.left = std::clamp((left - padX) / scale, 0.0f, static_cast<float>(imageWidth));
+    obj.top = std::clamp((top - padY) / scale, 0.0f, static_cast<float>(imageHeight));
+    obj.right = std::clamp((right - padX) / scale, 0.0f, static_cast<float>(imageWidth));
+    obj.bottom = std::clamp((bottom - padY) / scale, 0.0f, static_cast<float>(imageHeight));
+    obj.label = label;
+    obj.prob = score;
+    return obj;
+}
+
+Object makeObjectFromCxcywh(
+        float cx,
+        float cy,
+        float w,
+        float h,
+        int label,
+        float score,
+        int imageWidth,
+        int imageHeight,
+        float scale,
+        float padX,
+        float padY) {
+    return makeObjectFromXyxy(
+            cx - w * 0.5f,
+            cy - h * 0.5f,
+            cx + w * 0.5f,
+            cy + h * 0.5f,
+            label,
+            score,
+            imageWidth,
+            imageHeight,
+            scale,
+            padX,
+            padY);
+}
+
 std::vector<Object> parseOutput(
         const Detector& detector,
         const ncnn::Mat& out,
@@ -228,56 +276,107 @@ std::vector<Object> parseOutput(
     const float padX = (detector.inputWidth - imageWidth * scale) * 0.5f;
     const float padY = (detector.inputHeight - imageHeight * scale) * 0.5f;
 
-    const int featureCount = out.h == outputChannels ? out.w : out.h;
-    const bool channelFirst = out.h == outputChannels;
+    const bool endToEndRowMajor = out.w == 6;
+    const bool endToEndChannelFirst = out.h == 6;
+    if (endToEndRowMajor || endToEndChannelFirst) {
+        const int rowCount = endToEndRowMajor ? out.h : out.w;
+        for (int i = 0; i < rowCount; i++) {
+            float left;
+            float top;
+            float right;
+            float bottom;
+            float score;
+            int label;
 
-    for (int i = 0; i < featureCount; i++) {
-        float cx;
-        float cy;
-        float w;
-        float h;
-        int label = -1;
-        float score = 0.0f;
+            if (endToEndRowMajor) {
+                const float* row = out.row(i);
+                left = row[0];
+                top = row[1];
+                right = row[2];
+                bottom = row[3];
+                score = row[4];
+                label = static_cast<int>(std::round(row[5]));
+            } else {
+                left = out.row(0)[i];
+                top = out.row(1)[i];
+                right = out.row(2)[i];
+                bottom = out.row(3)[i];
+                score = out.row(4)[i];
+                label = static_cast<int>(std::round(out.row(5)[i]));
+            }
 
-        if (channelFirst) {
-            cx = out.row(0)[i];
-            cy = out.row(1)[i];
-            w = out.row(2)[i];
-            h = out.row(3)[i];
-            for (int classId = 0; classId < classCount; classId++) {
-                const float classScore = out.row(4 + classId)[i];
-                if (classScore > score) {
-                    score = classScore;
-                    label = classId;
+            if (score < scoreThreshold) {
+                continue;
+            }
+            proposals.push_back(makeObjectFromXyxy(
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    label,
+                    score,
+                    imageWidth,
+                    imageHeight,
+                    scale,
+                    padX,
+                    padY));
+        }
+    } else {
+        const int featureCount = out.h == outputChannels ? out.w : out.h;
+        const bool channelFirst = out.h == outputChannels;
+
+        for (int i = 0; i < featureCount; i++) {
+            float cx;
+            float cy;
+            float w;
+            float h;
+            int label = -1;
+            float score = 0.0f;
+
+            if (channelFirst) {
+                cx = out.row(0)[i];
+                cy = out.row(1)[i];
+                w = out.row(2)[i];
+                h = out.row(3)[i];
+                for (int classId = 0; classId < classCount; classId++) {
+                    const float classScore = out.row(4 + classId)[i];
+                    if (classScore > score) {
+                        score = classScore;
+                        label = classId;
+                    }
+                }
+            } else {
+                const float* row = out.row(i);
+                cx = row[0];
+                cy = row[1];
+                w = row[2];
+                h = row[3];
+                for (int classId = 0; classId < classCount; classId++) {
+                    const float classScore = row[4 + classId];
+                    if (classScore > score) {
+                        score = classScore;
+                        label = classId;
+                    }
                 }
             }
-        } else {
-            const float* row = out.row(i);
-            cx = row[0];
-            cy = row[1];
-            w = row[2];
-            h = row[3];
-            for (int classId = 0; classId < classCount; classId++) {
-                const float classScore = row[4 + classId];
-                if (classScore > score) {
-                    score = classScore;
-                    label = classId;
-                }
+
+            if (score < scoreThreshold) {
+                continue;
             }
-        }
 
-        if (score < scoreThreshold) {
-            continue;
+            proposals.push_back(makeObjectFromCxcywh(
+                    cx,
+                    cy,
+                    w,
+                    h,
+                    label,
+                    score,
+                    imageWidth,
+                    imageHeight,
+                    scale,
+                    padX,
+                    padY));
         }
-
-        Object obj{};
-        obj.left = std::clamp((cx - w * 0.5f - padX) / scale, 0.0f, static_cast<float>(imageWidth));
-        obj.top = std::clamp((cy - h * 0.5f - padY) / scale, 0.0f, static_cast<float>(imageHeight));
-        obj.right = std::clamp((cx + w * 0.5f - padX) / scale, 0.0f, static_cast<float>(imageWidth));
-        obj.bottom = std::clamp((cy + h * 0.5f - padY) / scale, 0.0f, static_cast<float>(imageHeight));
-        obj.label = label;
-        obj.prob = score;
-        proposals.push_back(obj);
     }
 
     std::sort(proposals.begin(), proposals.end(), [](const Object& a, const Object& b) {
